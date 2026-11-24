@@ -39,8 +39,8 @@ python winbuild.py build --board cardputer_adv_cap
 
 Known limits of this variant:
 
-- The Cap's ST25R3916 NFC front-end is **not supported** yet (its CS is held high
-  at boot so it stays off the shared SPI3 bus).
+- The Cap's ST25R3916 NFC front-end is supported (CS=G6, IRQ=G4) via the updated
+  driver above; it shares SPI3 with the CC1101 and SD card.
 - **nRF24L01 is unavailable** — its CE/CSN pins (G4/G6) belong to the NFC chip.
 - Never hot-plug the Cap: power the Cardputer off before attaching/removing it.
 - GPIO3 is the module's DC-DC enable (100k pull-up, on by default). Do not drive
@@ -48,6 +48,38 @@ Known limits of this variant:
 
 
 ![M5Stack Cardputer Side](pic2.png)
+
+---
+
+## Changes in This Fork
+
+### 🈶 Chinese-localized UI (菜单汉化)
+
+The whole UI is translated into Simplified Chinese — desktop, settings, archive
+browser and all app scenes/dialogs (Sub-GHz, NFC, Infrared, iButton, Bad USB,
+WiFi, BLE, GPIO, MP3 player, …). `u8g2` renders CJK text with the bundled
+WQY-12 font, and FATFS uses `CONFIG_FATFS_API_ENCODING_UTF_8=y` so Chinese
+filenames (e.g. MP3 track titles) display correctly. About 360+ strings across
+89 source files are localized.
+
+### 📡 M5Stack Cap CC1101 driver update (Cap 三频段切换)
+
+The Cap CC1101 (SKU U219) selects one of three antenna paths with **two**
+switches — and one of them is not a host GPIO at all:
+
+| Band | RF_SW0 (GPIO13, host) | RF_SW1 (CC1101 GDO2 via `IOCFG2`) |
+|---|---|---|
+| 315 MHz | Low | High (`IOCFG2=0x2F`) |
+| 433 MHz | High | Low (`IOCFG2=0x2E`) |
+| 868/915 MHz | High | High (`IOCFG2=0x2F`) |
+
+`furi_hal_subghz_set_path()` drives both switches on every band change. A chip
+reset (`SRES`) restores `IOCFG2` to its default `0x29`, so the cached value is
+invalidated on reset to guarantee the path is re-applied. The Cap's ST25R3916
+NFC front-end shares SPI3 with the CC1101 and SD card and is isolated from the
+bus by a CS guard during sub-GHz/SD transactions. Use the
+`m5stack_cardputer_adv_cap` board variant (CS=G5, GDO0=G15, SW0=G13,
+NFC CS=G6 / IRQ=G4).
 
 ---
 # **Frequent Question**

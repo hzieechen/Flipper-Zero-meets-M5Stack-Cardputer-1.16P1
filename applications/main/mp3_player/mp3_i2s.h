@@ -9,7 +9,8 @@
 extern "C" {
 #endif
 
-/* I2S_NUM_0 owner for the MP3 player. Pulls stereo int16 samples from a
+/* I2S_NUM_1 owner for the MP3 player (Cardputer-Adv: mic uses I2S0). Pulls
+ * stereo int16 samples from a
  * ring buffer fed by the decoder thread. The sample rate can be changed
  * at runtime when a new file with a different rate starts.
  *

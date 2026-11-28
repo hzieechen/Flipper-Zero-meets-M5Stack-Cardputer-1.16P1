@@ -64,6 +64,13 @@ static FuriMutex* speaker_mutex = NULL;
 static i2s_chan_handle_t i2s_tx_handle = NULL;
 static bool i2s_channel_enabled = false;
 
+#if defined(BOARD_HAS_MIC) && BOARD_HAS_MIC
+/* Full-duplex RX side of the same I2S_NUM_0 channel: reads the ES8311 ADC (mic).
+ * Owned here (shared clocks with TX); furi_hal_mic.c drives it via the accessor. */
+static i2s_chan_handle_t i2s_rx_handle = NULL;
+static bool es8311_adc_inited = false;
+#endif
+
 /* Active mode — read by writer thread, written by API callers under ownership. */
 static volatile SpeakerMode speaker_mode = SpeakerModeIdle;
 
@@ -145,6 +152,61 @@ void furi_hal_speaker_es8311_set_volume_reg(float volume) {
     if(volume > 1.0f) volume = 1.0f;
     es8311_write(0x32, (uint8_t)(volume * 255.0f)); /* 0x00 mute .. 0xFF max */
 }
+
+#if defined(BOARD_HAS_MIC) && BOARD_HAS_MIC
+/* ES8311 ADC / microphone capture path. Values follow M5Unified's
+ * _microphone_enabled_cb_cardputer_adv() — the known-good sequence for THIS
+ * board. The critical difference from playback is reg 0x01=0xBA (mic clock
+ * routing) vs 0xB5 for the DAC. The old sequence left 0x01 at 0xB5 and wrote
+ * 0x14=0x5A/0x17=0xFF, which produced all-zero recordings.
+ *
+ * Reg 0x0D must be written while the I2S clock is running to arm the capture
+ * path; furi_hal_mic_start() enables the shared TX channel first, so this is
+ * satisfied. */
+static const uint8_t es8311_adc_seq[][2] = {
+    {0x00, 0x80}, /* CSM power on */
+    {0x01, 0xBA}, /* clock manager: MIC variant (playback uses 0xB5) */
+    {0x02, 0x18}, /* clock manager: MULT_PRE=3 */
+    {0x0D, 0x01}, /* power up analog circuitry */
+    {0x0E, 0x02}, /* enable analog PGA + ADC modulator */
+    {0x14, 0x10}, /* Mic1p-Mic1n input, minimum PGA gain */
+    {0x17, 0xBF}, /* ADC volume 0 dB (0xFF clips) */
+    {0x1C, 0x6A}, /* ADC EQ bypass + DC offset cancel */
+};
+
+void furi_hal_speaker_es8311_adc_init(void) {
+    if(es8311_adc_inited) return;
+    es8311_ensure_init(); /* codec base (clocks/power) must be up first */
+    es8311_adc_inited = true;
+
+    unsigned nacks = 0;
+    for(size_t i = 0; i < sizeof(es8311_adc_seq) / sizeof(es8311_adc_seq[0]); i++) {
+        if(es8311_write(es8311_adc_seq[i][0], es8311_adc_seq[i][1]) != ESP_OK) nacks++;
+    }
+    FURI_LOG_I(TAG, "ES8311 ADC/mic init done (0x01=0xBA, %u write errors)", nacks);
+}
+
+void furi_hal_speaker_es8311_restore_playback(void) {
+#if defined(BOARD_HAS_ES8311) && BOARD_HAS_ES8311
+    if(!es8311_inited) return;
+
+    /* Re-apply the DAC-side registers without the reset (es8311_seq[0]) so
+     * playback keeps working after the mic path changed 0x01 to 0xBA. */
+    unsigned nacks = 0;
+    for(size_t i = 1; i < sizeof(es8311_seq) / sizeof(es8311_seq[0]); i++) {
+        if(es8311_write(es8311_seq[i][0], es8311_seq[i][1]) != ESP_OK) nacks++;
+    }
+    es8311_adc_inited = false;
+    FURI_LOG_I(TAG, "ES8311 playback restored (0x01=0xB5, %u write errors)", nacks);
+#endif
+}
+
+void* furi_hal_speaker_i2s_rx_handle(void) {
+    /* Kept for API compatibility. The mic owns I2S_NUM_0 now; this speaker
+     * channel is TX-only on I2S_NUM_1. */
+    return NULL;
+}
+#endif /* BOARD_HAS_MIC */
 #endif
 
 /* ---- Helpers ---- */
@@ -253,10 +315,14 @@ void furi_hal_speaker_init(void) {
     gpio_reset_pin((gpio_num_t)BOARD_PIN_SPEAKER_WCLK);
 
     /* Configure I2S standard mode */
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    /* M5Unified's official Cardputer-Adv mapping: speaker on I2S1, mic on I2S0. */
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num = SPEAKER_DMA_DESC_NUM;
     chan_cfg.dma_frame_num = SPEAKER_DMA_FRAME_NUM;
     chan_cfg.auto_clear = true; /* send silence when no data */
+    /* TX only. The microphone owns I2S_NUM_0 at 16 kHz (see furi_hal_mic.c),
+     * matching M5Unified's Cardputer-Adv setup. Keeping this channel TX-only
+     * also avoids an unused RX DMA allocation on this PSRAM-less board. */
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &i2s_tx_handle, NULL));
 
     i2s_std_config_t std_cfg = {
@@ -306,6 +372,14 @@ void furi_hal_speaker_deinit(void) {
     i2s_del_channel(i2s_tx_handle);
     i2s_tx_handle = NULL;
 
+#if defined(BOARD_HAS_MIC) && BOARD_HAS_MIC
+    if(i2s_rx_handle) {
+        i2s_del_channel(i2s_rx_handle);
+        i2s_rx_handle = NULL;
+    }
+    es8311_adc_inited = false;
+#endif
+
     /* Free buffer */
     if(wave_buffer) {
         free(wave_buffer);
@@ -339,6 +413,23 @@ void furi_hal_speaker_codec_init(void) {
 #if defined(BOARD_HAS_ES8311) && BOARD_HAS_ES8311
     es8311_ensure_init();
 #endif
+}
+
+void furi_hal_speaker_suspend_clocks(void) {
+    /* Called by the mic HAL: both I2S masters share BCLK/WS GPIOs, so the
+     * speaker must stop driving them while I2S0 captures. */
+    if(i2s_tx_handle && i2s_channel_enabled) {
+        i2s_channel_disable(i2s_tx_handle);
+        i2s_channel_enabled = false;
+    }
+}
+
+void furi_hal_speaker_resume_clocks(void) {
+    if(i2s_tx_handle && !i2s_channel_enabled) {
+        if(i2s_channel_enable(i2s_tx_handle) == ESP_OK) {
+            i2s_channel_enabled = true;
+        }
+    }
 }
 
 void furi_hal_speaker_release(void) {
@@ -442,6 +533,12 @@ void furi_hal_speaker_stop(void) {
 }
 
 void furi_hal_speaker_codec_init(void) {
+}
+
+void furi_hal_speaker_suspend_clocks(void) {
+}
+
+void furi_hal_speaker_resume_clocks(void) {
 }
 
 #endif /* BOARD_HAS_SPEAKER */

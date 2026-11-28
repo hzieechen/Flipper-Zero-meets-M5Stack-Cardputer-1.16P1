@@ -1,0 +1,10 @@
+App(
+    appid="ir_thermo",
+    name="红外测温",
+    apptype=FlipperAppType.MENUEXTERNAL,
+    entry_point="ir_thermo_app",
+    requires=["gui"],
+    stack_size=4 * 1024,
+    order=87,
+    icon="A_Plugins_14",
+)

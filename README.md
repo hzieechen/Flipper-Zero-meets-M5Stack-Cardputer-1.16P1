@@ -81,6 +81,40 @@ bus by a CS guard during sub-GHz/SD transactions. Use the
 `m5stack_cardputer_adv_cap` board variant (CS=G5, GDO0=G15, SW0=G13,
 NFC CS=G6 / IRQ=G4).
 
+### 🌡️ Environment monitor app (环境监测)
+
+A new menu app **环境监测** reads an **M5Stack Chain ENV (SKU U234)** plugged
+into the Cap's HY2.0-4P Grove header and shows temperature / humidity /
+pressure / altitude. It includes a calibration submenu with two modes:
+
+- **按海平面气压校准** — enter the local sea-level pressure (300.0–1100.0 hPa)
+- **按当前海拔校准** — enter your current altitude (−500–9000 m); the device
+  derives sea-level pressure from it (takes ~4 s)
+
+Calibration is saved to the ENV module's own flash (survives power-off).
+
+⚠️ **Wiring / pin sharing**: the Cap Grove port is a fixed I²C pass-through
+(SDA=GPIO2, SCL=GPIO1), while Chain ENV speaks UART 115200. The app temporarily
+re-routes those two pads to UART1 — connect ENV **TX→GPIO2 (SDA)**, **RX→GPIO1
+(SCL)**, and take 5V/GND from the Grove header. GPIO1 is also the IR receiver,
+so **IR RX and Grove I²C are unavailable while this app runs**; the original
+pinmux is restored on exit. See `docs/chain_env_monitor_design.md`.
+
+### 🌡️ Infrared thermometer app (红外测温)
+
+A new menu app **红外测温** reads an **M5Stack Unit NCIR2 (SKU U150)** — an
+MLX90614 non-contact IR sensor front-end — over I²C at address 0x5A on the
+same Grove pads (SDA=GPIO2, SCL=GPIO1). Press **OK** to start continuous
+sampling (0.5 s) with a live large-number read-out in °C; press **OK** again
+to stop and keep the last value. Range −70~380 °C, ±0.5 °C.
+
+⚠️ **Wiring / pin sharing**: NCIR2 is I²C and is electrically parallel with
+Chain ENV on the two Grove pads. The two modules use different protocols
+(I²C vs UART), so they do not interfere even when both are connected — but
+only one app should actively sample at a time. The thermometer installs
+I²C_NUM_1 on GPIO2/GPIO1 and deletes the driver on exit, handing the pads
+back for the Chain ENV app's UART1. See `components/ncir2/`.
+
 ---
 # **Frequent Question**
 ## Can i run flipper zero without SD card?

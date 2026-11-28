@@ -1,0 +1,10 @@
+App(
+    appid="env_monitor",
+    name="环境监测",
+    apptype=FlipperAppType.MENUEXTERNAL,
+    entry_point="env_monitor_app",
+    requires=["gui"],
+    stack_size=8 * 1024,
+    order=86,
+    icon="A_Plugins_14",
+)

@@ -71,10 +71,18 @@ void furi_hal_speaker_stop(void);
  * On Cardputer-ADV the speaker is an ES8311 codec that needs an I2C register
  * sequence before it will pass I2S data. The normal path configures it lazily
  * in furi_hal_speaker_acquire(); apps that deinit the speaker HAL and take over
- * I2S_NUM_0 themselves (e.g. the MP3 player) must call this after enabling the
+ * I2S_NUM_1 themselves (e.g. the MP3 player) must call this after enabling the
  * I2S channel. No-op on boards with a plain I2S amplifier.
  */
 void furi_hal_speaker_codec_init(void);
+
+/** Stop/resume the speaker I2S clocks while another I2S master shares BCLK/WS.
+ *
+ * The mic HAL uses I2S0 on Cardputer-Adv; both masters drive the same pins, so
+ * the speaker must release them during capture. Safe to call from any task.
+ */
+void furi_hal_speaker_suspend_clocks(void);
+void furi_hal_speaker_resume_clocks(void);
 
 /** Mirror a GPIO pin (e.g. CC1101 GDO0) onto the speaker as 1-bit audio.
  *
@@ -88,6 +96,20 @@ void furi_hal_speaker_codec_init(void);
  * @param      volume   Output volume 0.0–1.0 (cubic-curve scaled, like _start)
  */
 void furi_hal_speaker_start_gdo_mirror(const GpioPin* gdo_pin, float volume);
+
+/* --- Shared audio internals for the microphone HAL (furi_hal_mic.c) ---
+ * On boards where the mic is the ES8311 codec ADC it uses I2S0 (speaker uses
+ * I2S1) and shares the codec. These are referenced from furi_hal_mic.c's
+ * mic-enabled build path. */
+
+/** Full-duplex I2S RX channel handle (i2s_chan_handle_t as void*), or NULL. */
+void* furi_hal_speaker_i2s_rx_handle(void);
+
+/** Idempotently apply the ES8311 ADC/mic register sequence (brings up capture). */
+void furi_hal_speaker_es8311_adc_init(void);
+
+/** Restore ES8311 playback registers after capture (0x01 back to 0xB5). */
+void furi_hal_speaker_es8311_restore_playback(void);
 
 #ifdef __cplusplus
 }

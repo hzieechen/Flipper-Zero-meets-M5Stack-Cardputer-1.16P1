@@ -47,3 +47,7 @@ releases/*.zip
 
 # Merged flashable images (reproducible from build_<board>/ via esptool merge_bin)
 *-merged.bin
+*-merged-*.bin
+
+# Local debug logs / captures
+mp3_crash_log.txt

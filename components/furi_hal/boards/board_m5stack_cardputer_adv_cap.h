@@ -20,9 +20,20 @@
  *    Cap truth table: 315MHz = SW0 0/SW1 1, 433MHz = 1/0, 868-915MHz = 1/1.
  *  - GPIO4/GPIO6 belong to the Cap's ST25R3916, so NRF24 is unmapped here —
  *    an nRF24L01 module cannot be used while the Cap is plugged in.
- *  - This firmware has no ST25R3916 driver: GPIO6 is held HIGH at boot so the
- *    NFC chip stays off the shared SPI3 bus (BOARD_PIN_NFC_CS_GUARD).
+ *  - NFC is supported: the ST25R3916 (CS=GPIO6, IRQ=GPIO4) shares SPI3 with
+ *    the CC1101; CS guard logic keeps the two chip selects isolated.
  *  - Never drive GPIO3 low — that is the module's DC-DC enable.
+ *
+ * Grove HY2.0-4P pass-through (J1) — shared I2C bus, no device on the Cap:
+ *   yellow SDA = GPIO2, white SCL = GPIO1 (BOARD_PIN_QWIIC_SDA/SCL, I2C_NUM_1).
+ * These two pads are multi-used: GPIO1 is also the IR receiver (BOARD_PIN_IR_RX).
+ * The env_monitor app re-routes GPIO2/GPIO1 to UART1 (115200) to talk to a
+ * Chain ENV node and restores the pinmux on exit; while it runs, IR RX and
+ * Grove I2C are unavailable. See components/env_chain/.
+ * The ir_thermo app instead installs I2C_NUM_1 on these pads (NCIR2 @0x5A)
+ * and deletes the driver on exit. Two modules may stay wired in parallel —
+ * NCIR2 is I2C, Chain ENV is UART — but only one app samples at a time.
+ * See components/ncir2/.
  */
 
 #pragma once

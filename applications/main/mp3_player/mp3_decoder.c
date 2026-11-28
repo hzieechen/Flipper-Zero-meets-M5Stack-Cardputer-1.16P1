@@ -19,6 +19,11 @@
 /* Largest Helix output frame: 1152 stereo samples = 4608 bytes. */
 #define PCM_FRAMES_MAX  1152
 
+typedef enum {
+    TrackFormatMp3,
+    TrackFormatWav,
+} TrackFormat;
+
 typedef struct {
     HMP3Decoder       hmp3;
     Storage*          storage;
@@ -32,6 +37,13 @@ typedef struct {
     int16_t*          pcm;          /* internal RAM, holds one decoded frame */
     uint32_t          sample_rate;  /* current track sample rate */
     uint8_t           channels;
+
+    TrackFormat       format;
+    /* WAV-only: raw PCM, no decoder needed */
+    uint32_t          wav_data_offset;
+    uint32_t          wav_data_size;
+    uint8_t           wav_bits;
+    uint8_t           wav_block_align;
 
     uint64_t          file_size;
     uint64_t          file_pos;     /* bytes consumed from file */
@@ -118,11 +130,159 @@ static void decoder_estimate_duration(Mp3DecoderState* d, const MP3FrameInfo* fi
     d->duration_ms = (uint32_t)millis;
 }
 
+/* ------------- WAV (raw PCM) support ------------- */
+
+static uint16_t read_le16(const uint8_t* p) {
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint32_t read_le32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+/* Detect "RIFF....WAVE" and parse the fmt/data chunks. We only accept
+ * 16-bit PCM (the format the recorder writes); 8/24-bit and float are
+ * rejected so we never emit garbage audio. False means "not a WAV we can
+ * play" — the caller falls back to the MP3 path. */
+static bool decoder_parse_wav(Mp3DecoderState* d) {
+    uint8_t hdr[12];
+    storage_file_seek(d->file, 0, true);
+    if(storage_file_read(d->file, hdr, sizeof(hdr)) != sizeof(hdr)) return false;
+    if(memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) return false;
+
+    uint64_t pos = 12;
+    bool have_fmt = false;
+    while(pos + 8 <= d->file_size) {
+        storage_file_seek(d->file, (uint32_t)pos, true);
+        uint8_t chunk[8];
+        if(storage_file_read(d->file, chunk, sizeof(chunk)) != sizeof(chunk)) return false;
+        uint32_t csize = read_le32(chunk + 4);
+        uint64_t data_pos = pos + 8;
+
+        if(memcmp(chunk, "fmt ", 4) == 0 && csize >= 16) {
+            uint8_t fmt[16];
+            if(storage_file_read(d->file, fmt, sizeof(fmt)) != sizeof(fmt)) return false;
+            uint16_t audio_format = read_le16(fmt + 0);
+            uint16_t channels = read_le16(fmt + 2);
+            uint32_t sample_rate = read_le32(fmt + 4);
+            uint16_t bits = read_le16(fmt + 14);
+
+            /* 1 = PCM integer. Only 16-bit, mono/stereo supported. */
+            if(audio_format != 1 || bits != 16 || (channels != 1 && channels != 2)) {
+                FURI_LOG_W(TAG, "WAV: unsupported format=%u bits=%u ch=%u", audio_format, bits, channels);
+                return false;
+            }
+            d->sample_rate = sample_rate;
+            d->channels = (uint8_t)channels;
+            d->wav_bits = (uint8_t)bits;
+            d->wav_block_align = (uint8_t)(channels * bits / 8);
+            have_fmt = true;
+        } else if(memcmp(chunk, "data", 4) == 0) {
+            if(!have_fmt) return false; /* fmt must come before data */
+            d->wav_data_offset = (uint32_t)data_pos;
+            d->wav_data_size = csize;
+            if(d->wav_block_align == 0 || d->sample_rate == 0) return false;
+            d->duration_ms = (uint32_t)(((uint64_t)csize * 1000) /
+                                        ((uint64_t)d->sample_rate * d->wav_block_align));
+            FURI_LOG_I(TAG, "WAV: %lu Hz, %u ch, 16-bit, %lu ms",
+                       (unsigned long)d->sample_rate, d->channels,
+                       (unsigned long)d->duration_ms);
+            return true;
+        }
+
+        /* Chunks are word-aligned; skip padding byte if size is odd. */
+        pos = data_pos + csize + (csize & 1u);
+    }
+    return false;
+}
+
+/* WAV playback: read raw PCM in manageable batches, expand mono to stereo,
+ * push to the same I2S ring buffer the MP3 path uses. Volume/pause/ended
+ * behaviour is shared with MP3 by design. */
+static int32_t decoder_task_wav(void* ctx) {
+    Mp3DecoderState* d = ctx;
+    FURI_LOG_I(TAG, "WAV worker started");
+    const size_t max_frames = PCM_FRAMES_MAX;
+    uint8_t* batch = d->read_buf; /* reuse the 8 KB read buffer for raw bytes */
+    uint32_t done = 0;
+
+    /* Parse the header here in the worker thread, NOT in play() on the UI
+     * thread — file IO on the UI thread while holding the app mutex is a
+     * known crash source on this port. */
+    if(!decoder_parse_wav(d)) {
+        FURI_LOG_E(TAG, "WAV header parse failed");
+        d->playing = false;
+        if(d->file) storage_file_close(d->file);
+        mp3_i2s_flush();
+        if(d->ended_cb && !d->suppress_ended_cb) d->ended_cb(d->ended_ctx);
+        return 0;
+    }
+
+    mp3_i2s_set_sample_rate(d->sample_rate);
+    storage_file_seek(d->file, d->wav_data_offset, true);
+
+    while(d->playing && done < d->wav_data_size) {
+        if(d->pause_req)  { d->paused = true;  d->pause_req  = false; }
+        if(d->resume_req) { d->paused = false; d->resume_req = false; }
+        if(d->paused) {
+            furi_delay_ms(50);
+            continue;
+        }
+
+        uint32_t remaining = d->wav_data_size - done;
+        /* Read at most one push-worth of frames. Reading more would advance
+         * the file pointer past bytes we don't push, dropping audio. */
+        size_t max_bytes = max_frames * d->wav_block_align;
+        size_t want = remaining < max_bytes ? (size_t)remaining : max_bytes;
+        want -= want % d->wav_block_align; /* whole frames only */
+        if(want == 0) break;
+
+        uint16_t got = storage_file_read(d->file, batch, want);
+        if(got == 0) break;
+        got -= got % d->wav_block_align;
+        if(got == 0) break;
+        /* want <= max_bytes = max_frames * block_align, so no frame cap needed. */
+        size_t frames = got / d->wav_block_align;
+
+        if(d->channels == 1) {
+            /* Mono int16 -> stereo: expand back-to-front into pcm[]. */
+            int16_t* dst = d->pcm;
+            const int16_t* src = (const int16_t*)batch;
+            for(size_t i = frames; i > 0; i--) {
+                int16_t s = src[i - 1];
+                dst[(i - 1) * 2 + 0] = s;
+                dst[(i - 1) * 2 + 1] = s;
+            }
+            mp3_i2s_push(dst, frames, 1000);
+        } else {
+            /* Already interleaved stereo int16. */
+            memcpy(d->pcm, batch, got);
+            mp3_i2s_push(d->pcm, frames, 1000);
+        }
+
+        done += got;
+        d->file_pos += got;
+        d->elapsed_ms += (uint32_t)(((uint64_t)frames * 1000) / d->sample_rate);
+    }
+
+    /* Let the I2S queue drain before signalling end-of-track. */
+    while(mp3_i2s_has_pending() && d->playing) furi_delay_ms(50);
+
+    d->playing = false;
+    d->paused = false;
+    if(d->file) storage_file_close(d->file);
+    mp3_i2s_flush();
+    if(d->ended_cb && !d->suppress_ended_cb) d->ended_cb(d->ended_ctx);
+    return 0;
+}
+
 /* ------------- decoder thread ------------- */
 
 static int32_t decoder_task(void* ctx) {
     Mp3DecoderState* d = ctx;
     bool first_frame = true;
+    FURI_LOG_I(TAG, "MP3 worker started");
 
     /* Pre-read happens here (in the worker thread) so the UI thread doesn't
      * stall on SD-card IO while holding the app mutex. */
@@ -256,6 +416,32 @@ bool mp3_decoder_init(void) {
     d->storage = furi_record_open(RECORD_STORAGE);
     d->file    = storage_file_alloc(d->storage);
 
+    /* Allocate the decoder thread ONCE, here in init, while the heap is still
+     * contiguous. Allocating it inside play() required a fresh 8 KB contiguous
+     * internal block on every track start; on this PSRAM-less board the heap
+     * fragments and that allocation fails with a furi_check() abort. The
+     * thread object is kept for the lifetime of the app and only started/
+     * joined per track (see play()/stop()).
+     *
+     * furi_thread_alloc_ex() aborts via furi_check() if the stack cannot be
+     * allocated, so size it from the largest contiguous internal block. Leave
+     * ~1 KB headroom for the thread struct/name allocated immediately before
+     * the stack inside alloc_ex(). */
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t stack_sz = (largest >= 8192 + 1024) ? 8192 : 4096;
+    FURI_LOG_I(TAG, "decoder stack=%u largest=%u", (unsigned)stack_sz, (unsigned)largest);
+    d->thread = furi_thread_alloc_ex("Mp3Decoder", stack_sz, decoder_task, d);
+    if(!d->thread) {
+        storage_file_free(d->file);
+        furi_record_close(RECORD_STORAGE);
+        MP3FreeDecoder(d->hmp3);
+        heap_caps_free(d->read_buf);
+        heap_caps_free(d->pcm);
+        heap_caps_free(d);
+        return false;
+    }
+    furi_thread_set_priority(d->thread, FuriThreadPriorityNormal);
+
     g_dec = d;
     return true;
 }
@@ -263,6 +449,11 @@ bool mp3_decoder_init(void) {
 void mp3_decoder_deinit(void) {
     if(!g_dec) return;
     mp3_decoder_stop();
+    /* The thread (and its stack) lives as long as the app: release it here. */
+    if(g_dec->thread) {
+        furi_thread_free(g_dec->thread);
+        g_dec->thread = NULL;
+    }
     if(g_dec->file)    storage_file_free(g_dec->file);
     if(g_dec->storage) furi_record_close(RECORD_STORAGE);
     if(g_dec->hmp3)    MP3FreeDecoder(g_dec->hmp3);
@@ -301,12 +492,31 @@ bool mp3_decoder_play(const char* path) {
     g_dec->resume_req  = false;
     g_dec->channels    = 2;
 
-    /* Clear the suppression set by the stop() above: this new thread is a real
-     * track, so its natural EOF must notify the app again. */
+    /* Choose the worker by filename extension only — no file IO here.
+     * The WAV header is parsed inside decoder_task_wav, on the worker thread.
+     * MP3 keeps the exact same path it has always used. */
+    size_t plen = strlen(path);
+    g_dec->format =
+        (plen >= 4 && path[plen - 4] == '.' &&
+         (path[plen - 3] == 'w' || path[plen - 3] == 'W') &&
+         (path[plen - 2] == 'a' || path[plen - 2] == 'A') &&
+         (path[plen - 1] == 'v' || path[plen - 1] == 'V'))
+            ? TrackFormatWav
+            : TrackFormatMp3;
+    g_dec->file_pos = 0;
+
+    /* Reuse the persistent thread allocated in init(): no heap allocation
+     * happens on the play path any more. The worker callback is switched per
+     * format while the thread is in Stopped state. */
+    if(!g_dec->thread) return false;
+    furi_thread_set_callback(
+        g_dec->thread,
+        g_dec->format == TrackFormatWav ? decoder_task_wav : decoder_task);
+
+    /* Clear the suppression set by the stop() above: this track is real, so
+     * its natural EOF must notify the app again. */
     g_dec->suppress_ended_cb = false;
     g_dec->playing = true;
-    g_dec->thread  = furi_thread_alloc_ex("Mp3Decoder", 8192, decoder_task, g_dec);
-    furi_thread_set_priority(g_dec->thread, FuriThreadPriorityNormal);
     furi_thread_start(g_dec->thread);
     return true;
 }
@@ -327,9 +537,17 @@ void mp3_decoder_stop(void) {
      * switch track) is not a natural track-end and must not auto-advance. */
     g_dec->suppress_ended_cb = true;
     g_dec->playing = false;
-    furi_thread_join(g_dec->thread);
-    furi_thread_free(g_dec->thread);
-    g_dec->thread = NULL;
+
+    /* Never free the thread here — its 8 KB stack is the one allocated in
+     * init() and is reused for every track. join() waits for Stopping->Stopped
+     * via the scrub thread; furi_thread_set_callback/start in play() require
+     * state == Stopped, so make sure we actually reach it before returning. */
+    if(furi_thread_get_state(g_dec->thread) != FuriThreadStateStopped) {
+        furi_thread_join(g_dec->thread);
+        while(furi_thread_get_state(g_dec->thread) != FuriThreadStateStopped) {
+            furi_delay_ms(2);
+        }
+    }
 }
 
 bool mp3_decoder_is_playing(void) {

@@ -121,7 +121,8 @@ bool mp3_i2s_init(uint32_t sample_rate) {
      * configured as GPIO; release it before the I2S peripheral takes WS. */
     gpio_reset_pin((gpio_num_t)BOARD_PIN_SPEAKER_WCLK);
 
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    /* Cardputer-Adv official mapping: speaker I2S1, microphone I2S0. */
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num  = DMA_DESC_NUM;
     chan_cfg.dma_frame_num = DMA_FRAME_NUM;
     chan_cfg.auto_clear    = true;
@@ -145,7 +146,7 @@ bool mp3_i2s_init(uint32_t sample_rate) {
     if(i2s_channel_init_std_mode(i2s_tx, &std_cfg) != ESP_OK) goto err_std;
     if(i2s_channel_enable(i2s_tx) != ESP_OK)                   goto err_std;
 
-    /* The app deinitialises the standard speaker HAL to own I2S_NUM_0. On
+    /* The app deinitialises the standard speaker HAL to own I2S_NUM_1. On
      * Cardputer-ADV that HAL is also the only place that configures the ES8311
      * codec, so bring the codec up here now that the I2S clocks are running. */
     furi_hal_speaker_codec_init();
